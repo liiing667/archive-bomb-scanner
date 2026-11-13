@@ -11,13 +11,20 @@ use SplFileObject;
  */
 final class ZipBombEngine implements EngineInterface
 {
+    private const ENGINE_NAME = 'zip';
     private const MAX_RECURSION_DEPTH = 20;
     private const MAX_NESTED_ARCHIVE_SIZE = 104857600;
+    private const MAX_CACHE_ENTRIES = 1000;
 
     /**
      * @var array<string, float>
      */
     private array $nestedArchiveSizes = [];
+
+    /**
+     * @var bool Whether encrypted or corrupted entries were found
+     */
+    private bool $unknownEntries = false;
 
     /**
      * @var int
@@ -52,14 +59,36 @@ final class ZipBombEngine implements EngineInterface
         }
 
         if (!$this->isZip($file)) {
-            return new BombScannerResult(false);
+            return new BombScannerResult(false, self::ENGINE_NAME, 'Not a ZIP file');
         }
 
-        $fileSize = $file->getSize();
-        $result = $fileSize > 0 && $this->getOriginalSizeFromFile($file, $fileSize * $this->maxRatio) >=
-            $fileSize * $this->maxRatio;
+        // The cache is only valid within a single scan and for a specific budget
+        $this->nestedArchiveSizes = [];
+        $this->unknownEntries = false;
 
-        return new BombScannerResult($result);
+        $fileSize = $file->getSize();
+        $maxSize = $fileSize > 0 ? $fileSize * $this->maxRatio : 0.0;
+        $size = $fileSize > 0 ? $this->getOriginalSizeFromFile($file, $maxSize) : 0.0;
+
+        if ($fileSize > 0 && $size >= $maxSize) {
+            return new BombScannerResult(
+                true,
+                self::ENGINE_NAME,
+                sprintf('ZIP bomb detected: expansion ratio exceeds %d', $this->maxRatio),
+                BombScannerResult::STATUS_BOMB
+            );
+        }
+
+        if ($this->unknownEntries) {
+            return new BombScannerResult(
+                false,
+                self::ENGINE_NAME,
+                'Archive contains encrypted or corrupted entries',
+                BombScannerResult::STATUS_UNKNOWN
+            );
+        }
+
+        return new BombScannerResult(false, self::ENGINE_NAME, 'No ZIP bomb detected');
     }
 
     /**
@@ -72,10 +101,18 @@ final class ZipBombEngine implements EngineInterface
      * @throws RuntimeException
      *
      * @return float The original size
+     *
+     * @phpstan-impure
      */
     private function getOriginalSizeFromFile(SplFileObject $file, float $maxSize, int $depth = 0): float
     {
         $entries = $this->readFileCentralDirectoryEntries($file);
+
+        if ($entries === null) {
+            $this->unknownEntries = true;
+
+            return (float)$file->getSize();
+        }
 
         if ($entries === []) {
             return (float)$file->getSize();
@@ -123,6 +160,8 @@ final class ZipBombEngine implements EngineInterface
      * @throws RuntimeException
      *
      * @return float The original size
+     *
+     * @phpstan-impure
      */
     private function getFileEntryOriginalSize(SplFileObject $file, array $entry, int $depth, float $maxSize): float
     {
@@ -140,7 +179,13 @@ final class ZipBombEngine implements EngineInterface
 
         $contents = $this->getFileEntryContents($file, $entry);
 
-        if (!is_string($contents) || !str_starts_with($contents, "PK\3\4")) {
+        if (!is_string($contents)) {
+            $this->unknownEntries = true;
+
+            return (float)$originalSize;
+        }
+
+        if (!str_starts_with($contents, "PK\3\4")) {
             return (float)$originalSize;
         }
 
@@ -152,14 +197,14 @@ final class ZipBombEngine implements EngineInterface
      *
      * @param SplFileObject $file The zip file
      *
-     * @return array<int, array<string, int|string>> The central directory entries
+     * @return array<int, array<string, int|string>>|null The central directory entries, null if corrupted
      */
-    private function readFileCentralDirectoryEntries(SplFileObject $file): array
+    private function readFileCentralDirectoryEntries(SplFileObject $file): ?array
     {
         $fileSize = $file->getSize();
 
         if ($fileSize === false) {
-            return [];
+            return null;
         }
 
         $tailSize = min($fileSize, 65557);
@@ -168,7 +213,7 @@ final class ZipBombEngine implements EngineInterface
         $relativeEocdOffset = $this->findEndOfCentralDirectoryOffset($tail);
 
         if ($relativeEocdOffset === null || strlen($tail) < $relativeEocdOffset + 22) {
-            return [];
+            return null;
         }
 
         $entryCount = $this->readUnsignedShort($tail, $relativeEocdOffset + 10);
@@ -180,7 +225,7 @@ final class ZipBombEngine implements EngineInterface
             $entry = $this->readFileCentralDirectoryEntry($file, $offset);
 
             if ($entry === null) {
-                return [];
+                return null;
             }
 
             $entries[] = $entry;
@@ -273,17 +318,23 @@ final class ZipBombEngine implements EngineInterface
      * @throws RuntimeException
      *
      * @return float The original size
+     *
+     * @phpstan-impure
      */
     private function getOriginalSizeFromContents(string $contents, float $maxSize, int $depth): float
     {
-        $key = sha1($contents);
+        // The cached size is only valid for the budget (maxSize) it was calculated with
+        $key = sha1($contents) . ':' . $maxSize;
 
         if (isset($this->nestedArchiveSizes[$key])) {
             return min($this->nestedArchiveSizes[$key], $maxSize);
         }
 
         $result = $this->getOriginalSizeFromZipContents($contents, $maxSize, $depth);
-        $this->nestedArchiveSizes[$key] = $result;
+
+        if (count($this->nestedArchiveSizes) < self::MAX_CACHE_ENTRIES) {
+            $this->nestedArchiveSizes[$key] = $result;
+        }
 
         return $result;
     }
@@ -296,10 +347,18 @@ final class ZipBombEngine implements EngineInterface
      * @param int $depth The recursion depth
      *
      * @return float The original size
+     *
+     * @phpstan-impure
      */
     private function getOriginalSizeFromZipContents(string $contents, float $maxSize, int $depth): float
     {
         $entries = $this->readCentralDirectoryEntries($contents);
+
+        if ($entries === null) {
+            $this->unknownEntries = true;
+
+            return (float)strlen($contents);
+        }
 
         if ($entries === []) {
             return (float)strlen($contents);
@@ -345,6 +404,8 @@ final class ZipBombEngine implements EngineInterface
      * @param float $maxSize The maximum size to read
      *
      * @return float The original size
+     *
+     * @phpstan-impure
      */
     private function getMemoryEntryOriginalSize(string $contents, array $entry, int $depth, float $maxSize): float
     {
@@ -362,7 +423,13 @@ final class ZipBombEngine implements EngineInterface
 
         $nestedContents = $this->getMemoryEntryContents($contents, $entry);
 
-        if (!is_string($nestedContents) || !str_starts_with($nestedContents, "PK\3\4")) {
+        if (!is_string($nestedContents)) {
+            $this->unknownEntries = true;
+
+            return (float)$originalSize;
+        }
+
+        if (!str_starts_with($nestedContents, "PK\3\4")) {
             return (float)$originalSize;
         }
 
@@ -374,14 +441,14 @@ final class ZipBombEngine implements EngineInterface
      *
      * @param string $contents The zip archive contents
      *
-     * @return array<int, array<string, int|string>> The central directory entries
+     * @return array<int, array<string, int|string>>|null The central directory entries, null if corrupted
      */
-    private function readCentralDirectoryEntries(string $contents): array
+    private function readCentralDirectoryEntries(string $contents): ?array
     {
         $eocdOffset = $this->findEndOfCentralDirectoryOffset($contents);
 
         if ($eocdOffset === null || strlen($contents) < $eocdOffset + 22) {
-            return [];
+            return null;
         }
 
         $entryCount = $this->readUnsignedShort($contents, $eocdOffset + 10);
@@ -393,7 +460,7 @@ final class ZipBombEngine implements EngineInterface
             $entry = $this->readCentralDirectoryEntry($contents, $offset);
 
             if ($entry === null) {
-                return [];
+                return null;
             }
 
             $entries[] = $entry;

@@ -47,6 +47,23 @@ if ($scannerResult->isBomb()) {
 }
 ```
 
+### Scan result
+
+The scan result keeps the detection engine, the reason and the status:
+
+```php
+$scannerResult = $scanner->scanFile($file);
+
+$scannerResult->isBomb(); // bool
+$scannerResult->getStatus(); // safe, unknown or bomb
+$scannerResult->isSafe(); // true only if the file was fully verified as clean
+$scannerResult->getEngineName(); // e.g. zip
+$scannerResult->getReason(); // e.g. ZIP bomb detected: expansion ratio exceeds 1000
+```
+
+Archives with encrypted or corrupted entries cannot be fully inspected and
+are reported with the status `unknown` instead of being silently treated as safe.
+
 ### Scan in-memory ZIP file
 
 ```php

@@ -12,6 +12,8 @@ use SplFileObject;
  */
 final class RarBombEngine implements EngineInterface
 {
+    private const ENGINE_NAME = 'rar';
+
     /**
      * @var int
      */
@@ -45,7 +47,7 @@ final class RarBombEngine implements EngineInterface
         }
 
         if (!$this->isRar($file)) {
-            return new BombScannerResult(false);
+            return new BombScannerResult(false, self::ENGINE_NAME, 'Not a RAR file');
         }
 
         $fileReader = new RarFileReader();
@@ -58,11 +60,16 @@ final class RarBombEngine implements EngineInterface
             $ration = $originalSize / $compressedSize;
 
             if ($ration >= $this->maxRatio) {
-                return new BombScannerResult($ration >= $this->maxRatio);
+                return new BombScannerResult(
+                    true,
+                    self::ENGINE_NAME,
+                    sprintf('RAR bomb detected: expansion ratio exceeds %d', $this->maxRatio),
+                    BombScannerResult::STATUS_BOMB
+                );
             }
         }
 
-        return new BombScannerResult(false);
+        return new BombScannerResult(false, self::ENGINE_NAME, 'No RAR bomb detected');
     }
 
     /**

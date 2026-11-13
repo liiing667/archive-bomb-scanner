@@ -34,14 +34,25 @@ final class BombScanner
      */
     public function scanFile(SplFileObject $file): BombScannerResult
     {
+        $results = [];
+
         foreach ($this->engines as $engines) {
             $result = $engines->scanFile($file);
 
             if ($result->isBomb()) {
                 return $result;
             }
+
+            $results[] = $result;
         }
 
-        return new BombScannerResult(false);
+        // An inconclusive (unknown) result must not be silently reported as safe
+        foreach ($results as $result) {
+            if ($result->getStatus() === BombScannerResult::STATUS_UNKNOWN) {
+                return $result;
+            }
+        }
+
+        return $results[0] ?? new BombScannerResult(false);
     }
 }

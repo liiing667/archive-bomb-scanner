@@ -11,6 +11,8 @@ use SplFileObject;
  */
 final class PngBompEngine implements EngineInterface
 {
+    private const ENGINE_NAME = 'png';
+
     /**
      * Scan for PNG bomb.
      *
@@ -30,7 +32,7 @@ final class PngBompEngine implements EngineInterface
 
         if (!$this->isPng($file)) {
             // This is not a PNG
-            return new BombScannerResult(false);
+            return new BombScannerResult(false, self::ENGINE_NAME, 'Not a PNG file');
         }
 
         $file->rewind();
@@ -48,10 +50,15 @@ final class PngBompEngine implements EngineInterface
 
         if ($width > 10000 || $height > 10000) {
             // Invalid image
-            return new BombScannerResult(true);
+            return new BombScannerResult(
+                true,
+                self::ENGINE_NAME,
+                'PNG bomb detected: image dimensions exceed 10000 pixels',
+                BombScannerResult::STATUS_BOMB
+            );
         }
 
-        return new BombScannerResult(false);
+        return new BombScannerResult(false, self::ENGINE_NAME, 'No PNG bomb detected');
     }
 
     /**
