@@ -34,14 +34,20 @@ final class BombScanner
      */
     public function scanFile(SplFileObject $file): BombScannerResult
     {
+        $hasUnknown = false;
+
         foreach ($this->engines as $engines) {
             $result = $engines->scanFile($file);
 
             if ($result->isBomb()) {
                 return $result;
             }
+
+            if ($result->isUnknown()) {
+                $hasUnknown = true;
+            }
         }
 
-        return new BombScannerResult(false);
+        return new BombScannerResult($hasUnknown ? BombStatus::Unknown : BombStatus::Safe);
     }
 }

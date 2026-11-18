@@ -89,22 +89,33 @@ if ($scannerResult->isBomb()) {
 
 ```php
 use Selective\ArchiveBomb\Scanner\BombScanner;
-use Selective\ArchiveBomb\Engine\PngBombEngine;
+use Selective\ArchiveBomb\Engine\PngBompEngine;
+use Selective\ArchiveBomb\Scanner\BombStatus;
 use SplFileObject;
 
 $file = new SplFileObject('example.png');
 
 $scanner = new BombScanner();
-$scanner->addEngine(new PngBombEngine());
+$scanner->addEngine(new PngBompEngine());
 
 $scannerResult = $scanner->scanFile($file);
 
-if ($scannerResult->isBomb()) {
+if ($scannerResult->getStatus() === BombStatus::Bomb) {
     echo 'PNG bomb detected!';
+} elseif ($scannerResult->getStatus() === BombStatus::Unknown) {
+    echo 'Truncated, malformed or unsupported PNG, do not trust it.';
 } else {
     echo 'File is clean';
 }
 ```
+
+PNG detection evaluates the IHDR width, height, bit depth and colour type
+against the PNG value ranges, then converts them into a decoded pixel budget
+of at most 400,000,000 bytes (10000 * 10000 pixels * 4 channels * 1 byte).
+Truncated streams, malformed IHDR fields, unsupported formats and corrupt
+chunks return `BombStatus::Unknown` instead of being treated as safe.
+
+The PNG boundary matrix can be run with `php tests/run.php`.
 
 ## License
 
