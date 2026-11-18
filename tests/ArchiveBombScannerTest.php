@@ -9,6 +9,8 @@ use Selective\ArchiveBomb\Engine\RarBombEngine;
 use Selective\ArchiveBomb\Engine\ZipBombEngine;
 use Selective\ArchiveBomb\Scanner\BombScanner;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Type\ArchiveType;
+use Selective\ArchiveBomb\Type\ScanStatus;
 use SplFileObject;
 use SplTempFileObject;
 use ZipArchive;
@@ -171,5 +173,123 @@ final class ArchiveBombScannerTest extends TestCase
                 unlink($filename);
             }
         }
+    }
+
+    /**
+     * Test renamed and extension-less nested archives are detected by their
+     * content magic numbers instead of their member names.
+     */
+    public function testRenamedNestedArchiveIsDetectedByMagic(): void
+    {
+        $fixture = __DIR__ . '/files/nested/disguised-nested.zip';
+        $this->assertFileExists($fixture);
+
+        $scanner = new BombScanner();
+        $scanner->addEngine(new ZipBombEngine());
+
+        $result = $scanner->scanFile(new SplFileObject($fixture), 'container-disguised');
+
+        $this->assertTrue($result->isBomb());
+        $this->assertSame(ArchiveType::ZIP, $result->getType()->getId());
+        $this->assertSame(ScanStatus::ArchiveScanned, $result->getStatus());
+        $this->assertSame('container-disguised', $result->getContainerId());
+
+        $entries = $result->getNestedEntries();
+        $names = array_map(fn($entry): string => $entry->getName(), $entries);
+
+        $this->assertContains('bomb-disguised.txt', $names);
+        $this->assertContains('bomb-noext', $names);
+        $this->assertContains('clean-disguised.dat', $names);
+        $this->assertNotContains('plain.txt', $names);
+
+        foreach ($entries as $entry) {
+            $this->assertSame(ArchiveType::ZIP, $entry->getType()->getId());
+            $this->assertSame(ScanStatus::ArchiveScanned, $entry->getStatus());
+            $this->assertSame('container-disguised', $entry->getContainerId());
+        }
+    }
+
+    /**
+     * Test a truncated nested member gets an explicit truncated status.
+     */
+    public function testTruncatedNestedMemberHasExplicitStatus(): void
+    {
+        $fixture = __DIR__ . '/files/nested/truncated-nested.zip';
+        $this->assertFileExists($fixture);
+
+        $scanner = new BombScanner();
+        $scanner->addEngine(new ZipBombEngine());
+
+        $result = $scanner->scanFile(new SplFileObject($fixture), 'container-truncated');
+
+        $this->assertFalse($result->isBomb());
+
+        $entry = $this->findNestedEntry($result->getNestedEntries(), 'cut.bin');
+
+        $this->assertNotNull($entry);
+        $this->assertSame(ArchiveType::ZIP, $entry->getType()->getId());
+        $this->assertSame(ScanStatus::Truncated, $entry->getStatus());
+        $this->assertSame('container-truncated', $entry->getContainerId());
+    }
+
+    /**
+     * Test an unknown nested member with a faked name gets an explicit status.
+     */
+    public function testUnknownNestedMemberHasExplicitStatus(): void
+    {
+        $fixture = __DIR__ . '/files/nested/unknown-nested.zip';
+        $this->assertFileExists($fixture);
+
+        $scanner = new BombScanner();
+        $scanner->addEngine(new ZipBombEngine());
+
+        $result = $scanner->scanFile(new SplFileObject($fixture), 'container-unknown');
+
+        $this->assertFalse($result->isBomb());
+
+        $entry = $this->findNestedEntry($result->getNestedEntries(), 'fake.zip');
+
+        $this->assertNotNull($entry);
+        $this->assertSame(ArchiveType::UNKNOWN, $entry->getType()->getId());
+        $this->assertSame(ScanStatus::UnknownFormat, $entry->getStatus());
+    }
+
+    /**
+     * Test ordinary files are not treated as archives and keep their id.
+     */
+    public function testPlainFileIsUnaffected(): void
+    {
+        $fixture = __DIR__ . '/files/nested/plain-file.txt';
+        $this->assertFileExists($fixture);
+
+        $scanner = new BombScanner();
+        $scanner->addEngine(new ZipBombEngine());
+
+        $result = $scanner->scanFile(new SplFileObject($fixture), 'container-plain');
+
+        $this->assertFalse($result->isBomb());
+        $this->assertSame(ArchiveType::UNKNOWN, $result->getType()->getId());
+        $this->assertSame(ScanStatus::RegularFile, $result->getStatus());
+        $this->assertSame('container-plain', $result->getContainerId());
+        $this->assertSame([], $result->getNestedEntries());
+    }
+
+    /**
+     * Find a nested entry by its member name.
+     *
+     * @param array<int, \Selective\ArchiveBomb\Scanner\NestedArchiveEntry> $entries The entries
+     * @param string $name The member name
+     *
+     * @return \Selective\ArchiveBomb\Scanner\NestedArchiveEntry|null The entry
+     */
+    private function findNestedEntry(array $entries, string $name): ?\Selective\ArchiveBomb\Scanner\NestedArchiveEntry
+    {
+        foreach ($entries as $entry) {
+            if ($entry->getName() === $name) {
+                return $entry;
+            }
+        }
+
+        return null;
     }
 }

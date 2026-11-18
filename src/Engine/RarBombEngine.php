@@ -4,6 +4,8 @@ namespace Selective\ArchiveBomb\Engine;
 
 use RuntimeException;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Type\ArchiveType;
+use Selective\ArchiveBomb\Type\ScanStatus;
 use Selective\Rar\RarFileReader;
 use SplFileObject;
 
@@ -31,12 +33,13 @@ final class RarBombEngine implements EngineInterface
      * Scan for RAR bomb.
      *
      * @param SplFileObject $file The rar file
+     * @param string $containerId The id of the uploaded container
      *
      * @throws RuntimeException
      *
      * @return BombScannerResult The result
      */
-    public function scanFile(SplFileObject $file): BombScannerResult
+    public function scanFile(SplFileObject $file, string $containerId = ''): BombScannerResult
     {
         $realPath = $file->getRealPath();
 
@@ -45,7 +48,7 @@ final class RarBombEngine implements EngineInterface
         }
 
         if (!$this->isRar($file)) {
-            return new BombScannerResult(false);
+            return new BombScannerResult(false, $containerId);
         }
 
         $fileReader = new RarFileReader();
@@ -58,11 +61,16 @@ final class RarBombEngine implements EngineInterface
             $ration = $originalSize / $compressedSize;
 
             if ($ration >= $this->maxRatio) {
-                return new BombScannerResult($ration >= $this->maxRatio);
+                return new BombScannerResult(
+                    $ration >= $this->maxRatio,
+                    $containerId,
+                    ArchiveType::rar(),
+                    ScanStatus::ArchiveScanned
+                );
             }
         }
 
-        return new BombScannerResult(false);
+        return new BombScannerResult(false, $containerId, ArchiveType::rar(), ScanStatus::ArchiveScanned);
     }
 
     /**

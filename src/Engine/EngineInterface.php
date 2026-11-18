@@ -14,8 +14,9 @@ interface EngineInterface
      * Detect.
      *
      * @param SplFileObject $file The file
+     * @param string $containerId The id of the uploaded container
      *
      * @return BombScannerResult The result
      */
-    public function scanFile(SplFileObject $file): BombScannerResult;
+    public function scanFile(SplFileObject $file, string $containerId = ''): BombScannerResult;
 }

@@ -3,7 +3,11 @@
 namespace Selective\ArchiveBomb\Engine;
 
 use RuntimeException;
+use Selective\ArchiveBomb\Detector\ArchiveFormatDetector;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Scanner\NestedArchiveEntry;
+use Selective\ArchiveBomb\Type\ArchiveType;
+use Selective\ArchiveBomb\Type\ScanStatus;
 use SplFileObject;
 
 /**
@@ -20,6 +24,26 @@ final class ZipBombEngine implements EngineInterface
     private array $nestedArchiveSizes = [];
 
     /**
+     * @var ArchiveFormatDetector
+     */
+    private ArchiveFormatDetector $detector;
+
+    /**
+     * @var string The id of the uploaded container
+     */
+    private string $containerId = '';
+
+    /**
+     * @var array<int, NestedArchiveEntry>
+     */
+    private array $nestedEntries = [];
+
+    /**
+     * @var array<string, true> Contents already visited during classification
+     */
+    private array $classifiedContents = [];
+
+    /**
      * @var int
      */
     private int $maxRatio;
@@ -32,18 +56,20 @@ final class ZipBombEngine implements EngineInterface
     public function __construct(int $maxRatio = 1000)
     {
         $this->maxRatio = $maxRatio;
+        $this->detector = new ArchiveFormatDetector();
     }
 
     /**
      * Scan for ZIP bomb.
      *
      * @param SplFileObject $file The zip file
+     * @param string $containerId The id of the uploaded container
      *
      * @throws RuntimeException
      *
      * @return BombScannerResult The result
      */
-    public function scanFile(SplFileObject $file): BombScannerResult
+    public function scanFile(SplFileObject $file, string $containerId = ''): BombScannerResult
     {
         $realPath = $file->getRealPath();
 
@@ -51,15 +77,43 @@ final class ZipBombEngine implements EngineInterface
             throw new RuntimeException(sprintf('File not found: %s', $file->getFilename()));
         }
 
-        if (!$this->isZip($file)) {
-            return new BombScannerResult(false);
+        $this->containerId = $containerId;
+        $this->nestedEntries = [];
+        $this->classifiedContents = [];
+        $this->nestedArchiveSizes = [];
+
+        $detection = $this->detector->detectFile($file);
+        $type = $detection->getType();
+
+        // No archive signature: a regular file, another engine may handle it.
+        if ($type->isUnknown()) {
+            return new BombScannerResult(false, $containerId);
+        }
+
+        // The content claims to be an archive but misses required structure.
+        if ($detection->isTruncated()) {
+            return new BombScannerResult(false, $containerId, $type, ScanStatus::Truncated);
+        }
+
+        // A recognised archive that this engine cannot parse recursively.
+        if ($type->getId() !== ArchiveType::ZIP) {
+            return new BombScannerResult(false, $containerId, $type, ScanStatus::UnsupportedArchive);
         }
 
         $fileSize = $file->getSize();
+
+        // Classify every member first so the status reporting stays complete
+        // even when the size calculation short-circuits on a bomb ratio.
+        $this->classifyFileEntries($file);
+
         $result = $fileSize > 0 && $this->getOriginalSizeFromFile($file, $fileSize * $this->maxRatio) >=
             $fileSize * $this->maxRatio;
 
-        return new BombScannerResult($result);
+        $scanResult = new BombScannerResult($result, $containerId, $type, ScanStatus::ArchiveScanned);
+
+        $scanResult->setNestedEntries($this->nestedEntries);
+
+        return $scanResult;
     }
 
     /**
@@ -134,17 +188,13 @@ final class ZipBombEngine implements EngineInterface
 
         $name = (string)$entry['name'];
 
-        if (!str_ends_with(strtolower($name), '.zip')) {
-            return (float)$originalSize;
-        }
-
         $contents = $this->getFileEntryContents($file, $entry);
 
-        if (!is_string($contents) || !str_starts_with($contents, "PK\3\4")) {
+        if (!is_string($contents)) {
             return (float)$originalSize;
         }
 
-        return $this->getOriginalSizeFromContents($contents, $maxSize, $depth + 1);
+        return $this->resolveNestedEntrySize($name, $contents, $maxSize, $depth);
     }
 
     /**
@@ -356,17 +406,181 @@ final class ZipBombEngine implements EngineInterface
 
         $name = (string)$entry['name'];
 
-        if (!str_ends_with(strtolower($name), '.zip')) {
-            return (float)$originalSize;
-        }
-
         $nestedContents = $this->getMemoryEntryContents($contents, $entry);
 
-        if (!is_string($nestedContents) || !str_starts_with($nestedContents, "PK\3\4")) {
+        if (!is_string($nestedContents)) {
             return (float)$originalSize;
         }
 
-        return $this->getOriginalSizeFromContents($nestedContents, $maxSize, $depth + 1);
+        return $this->resolveNestedEntrySize($name, $nestedContents, $maxSize, $depth);
+    }
+
+    /**
+     * Resolve the original size of a nested member from its content magic
+     * numbers. The member extension is deliberately ignored so renamed or
+     * extension-less archives are still recognised and recursed into.
+     *
+     * @param string $name The member name inside the container
+     * @param string $contents The decompressed member contents
+     * @param float $maxSize The maximum size to read
+     * @param int $depth The recursion depth
+     *
+     * @return float The original size
+     */
+    private function resolveNestedEntrySize(string $name, string $contents, float $maxSize, int $depth): float
+    {
+        $detection = $this->detector->detectString($contents);
+        $type = $detection->getType();
+
+        if ($type->isUnknown()) {
+            return (float)strlen($contents);
+        }
+
+        if ($detection->isTruncated()) {
+            return (float)strlen($contents);
+        }
+
+        if ($type->getId() !== ArchiveType::ZIP) {
+            return (float)strlen($contents);
+        }
+
+        return $this->getOriginalSizeFromContents($contents, $maxSize, $depth + 1);
+    }
+
+    /**
+     * Classify every member of a file based ZIP container without size limits.
+     *
+     * @param SplFileObject $file The zip file
+     *
+     * @return void
+     */
+    private function classifyFileEntries(SplFileObject $file): void
+    {
+        foreach ($this->readFileCentralDirectoryEntries($file) as $entry) {
+            if ((int)$entry['compressed_size'] === 0) {
+                continue;
+            }
+
+            $originalSize = (int)$entry['original_size'];
+
+            if ($originalSize > self::MAX_NESTED_ARCHIVE_SIZE) {
+                continue;
+            }
+
+            $contents = $this->getFileEntryContents($file, $entry);
+
+            if (is_string($contents)) {
+                $this->classifyContents((string)$entry['name'], $contents, 1);
+            }
+        }
+    }
+
+    /**
+     * Classify in-memory contents and recurse into nested ZIP members.
+     *
+     * @param string $name The member name
+     * @param string $contents The member contents
+     * @param int $depth The recursion depth
+     *
+     * @return void
+     */
+    private function classifyContents(string $name, string $contents, int $depth): void
+    {
+        $key = sha1($contents);
+
+        $detection = $this->detector->detectString($contents);
+        $type = $detection->getType();
+
+        if ($type->isUnknown()) {
+            $this->recordNestedEntry(
+                $name,
+                $type,
+                $this->isArchiveName($name) ? ScanStatus::UnknownFormat : ScanStatus::RegularFile
+            );
+
+            $this->classifiedContents[$key] = true;
+
+            return;
+        }
+
+        if ($detection->isTruncated()) {
+            $this->recordNestedEntry($name, $type, ScanStatus::Truncated);
+
+            $this->classifiedContents[$key] = true;
+
+            return;
+        }
+
+        if ($type->getId() !== ArchiveType::ZIP) {
+            $status = $type->isContainer() ? ScanStatus::UnsupportedArchive : ScanStatus::ArchiveScanned;
+            $this->recordNestedEntry($name, $type, $status);
+
+            $this->classifiedContents[$key] = true;
+
+            return;
+        }
+
+        $this->recordNestedEntry($name, $type, ScanStatus::ArchiveScanned);
+
+        if ($depth >= self::MAX_RECURSION_DEPTH || isset($this->classifiedContents[$key])) {
+            return;
+        }
+
+        $this->classifiedContents[$key] = true;
+
+        foreach ($this->readCentralDirectoryEntries($contents) as $entry) {
+            if ((int)$entry['compressed_size'] === 0) {
+                continue;
+            }
+
+            if ((int)$entry['original_size'] > self::MAX_NESTED_ARCHIVE_SIZE) {
+                continue;
+            }
+
+            $nestedContents = $this->getMemoryEntryContents($contents, $entry);
+
+            if (is_string($nestedContents)) {
+                $this->classifyContents((string)$entry['name'], $nestedContents, $depth + 1);
+            }
+        }
+    }
+
+    /**
+     * Record a nested container member, keeping the outer container id.
+     *
+     * @param string $name The member name
+     * @param ArchiveType $type The content based format
+     * @param ScanStatus $status The scanning status
+     *
+     * @return void
+     */
+    private function recordNestedEntry(string $name, ArchiveType $type, ScanStatus $status): void
+    {
+        if ($status === ScanStatus::RegularFile) {
+            return;
+        }
+
+        $this->nestedEntries[] = new NestedArchiveEntry($this->containerId, $name, $type, $status);
+    }
+
+    /**
+     * Whether the member name pretends to be an archive by its extension.
+     *
+     * @param string $name The member name
+     *
+     * @return bool The status
+     */
+    private function isArchiveName(string $name): bool
+    {
+        $lowerName = strtolower($name);
+
+        foreach (['.zip', '.rar', '.7z', '.gz', '.gzip', '.bz2', '.bzip2', '.xz'] as $extension) {
+            if (str_ends_with($lowerName, $extension)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -561,19 +775,5 @@ final class ZipBombEngine implements EngineInterface
     private function readUnsignedLong(string $contents, int $offset): int
     {
         return unpack('V', substr($contents, $offset, 4))[1];
-    }
-
-    /**
-     * Detect file type.
-     *
-     * @param SplFileObject $file The file
-     *
-     * @return bool The status
-     */
-    private function isZip(SplFileObject $file): bool
-    {
-        $file->rewind();
-
-        return $file->fread(4) === "PK\3\4";
     }
 }
