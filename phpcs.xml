@@ -6,8 +6,11 @@
 
     <config name="ignore_warnings_on_exit" value="1"/>
 
-    <file>./src</file>
-    <file>./tests</file>
+<file>./src</file>
+<file>./tests</file>
+
+<!-- The standalone acceptance runner is an executable script, not a PSR-12 class. -->
+<exclude-pattern>./tests/run.php</exclude-pattern>
 
     <rule ref="PSR12"/>
 

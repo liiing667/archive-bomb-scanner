@@ -9,6 +9,7 @@ use Selective\ArchiveBomb\Engine\RarBombEngine;
 use Selective\ArchiveBomb\Engine\ZipBombEngine;
 use Selective\ArchiveBomb\Scanner\BombScanner;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Scanner\BombStatus;
 use SplFileObject;
 use SplTempFileObject;
 use ZipArchive;
@@ -48,7 +49,7 @@ final class ArchiveBombScannerTest extends TestCase
         $actual = $scanner->scanFile($file);
 
         $this->assertSame($expected, $actual->isBomb());
-        $this->assertTrue($actual->equals(new BombScannerResult($actual->isBomb())));
+        $this->assertTrue($actual->equals(new BombScannerResult($actual->getStatus())));
 
         // In memory scanning
         $tempFile = new SplTempFileObject();

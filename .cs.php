@@ -77,6 +77,7 @@ return (new Config())
             ->in(__DIR__ . '/src')
             ->in(__DIR__ . '/tests')
             ->name('*.php')
+            ->notPath('run.php')
             ->ignoreDotFiles(true)
             ->ignoreVCS(true)
     );

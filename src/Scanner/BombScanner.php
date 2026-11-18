@@ -34,14 +34,30 @@ final class BombScanner
      */
     public function scanFile(SplFileObject $file): BombScannerResult
     {
-        foreach ($this->engines as $engines) {
-            $result = $engines->scanFile($file);
+        $evidence = [];
+        $hasUnknown = false;
+
+        foreach ($this->engines as $engine) {
+            $result = $engine->scanFile($file);
+
+            foreach ($result->getEvidence() as $entryEvidence) {
+                $evidence[] = $entryEvidence;
+            }
 
             if ($result->isBomb()) {
-                return $result;
+                // A confirmed bomb always wins, but keep the complete trail.
+                return new BombScannerResult(BombStatus::Bomb, $evidence);
+            }
+
+            if ($result->isUnknown()) {
+                $hasUnknown = true;
             }
         }
 
-        return new BombScannerResult(false);
+        if ($hasUnknown) {
+            return new BombScannerResult(BombStatus::Unknown, $evidence);
+        }
+
+        return new BombScannerResult(BombStatus::Safe, $evidence);
     }
 }

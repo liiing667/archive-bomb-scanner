@@ -3,7 +3,9 @@
 namespace Selective\ArchiveBomb\Engine;
 
 use RuntimeException;
+use Selective\ArchiveBomb\Scanner\BombEvidence;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Scanner\BombStatus;
 use SplFileObject;
 
 /**
@@ -11,6 +13,11 @@ use SplFileObject;
  */
 final class ZipBombEngine implements EngineInterface
 {
+    /**
+     * Stable identifier used as prefix for every evidence identity.
+     */
+    public const ENGINE_ID = 'zip';
+
     private const MAX_RECURSION_DEPTH = 20;
     private const MAX_NESTED_ARCHIVE_SIZE = 104857600;
 
@@ -35,6 +42,16 @@ final class ZipBombEngine implements EngineInterface
     }
 
     /**
+     * Get the stable engine identifier.
+     *
+     * @return string The engine identifier
+     */
+    public function getId(): string
+    {
+        return self::ENGINE_ID;
+    }
+
+    /**
      * Scan for ZIP bomb.
      *
      * @param SplFileObject $file The zip file
@@ -52,14 +69,33 @@ final class ZipBombEngine implements EngineInterface
         }
 
         if (!$this->isZip($file)) {
-            return new BombScannerResult(false);
+            return new BombScannerResult(BombStatus::Safe);
         }
 
         $fileSize = $file->getSize();
         $result = $fileSize > 0 && $this->getOriginalSizeFromFile($file, $fileSize * $this->maxRatio) >=
             $fileSize * $this->maxRatio;
 
-        return new BombScannerResult($result);
+        if (!$result) {
+            return new BombScannerResult(BombStatus::Safe);
+        }
+
+        return new BombScannerResult(
+            BombStatus::Bomb,
+            [
+                new BombEvidence(
+                    $this->getId(),
+                    'archive#total',
+                    BombStatus::Bomb,
+                    sprintf(
+                        'Total unpacked size reaches the shared expansion budget of %d times the archive size.',
+                        $this->maxRatio
+                    ),
+                    (float)$fileSize,
+                    $fileSize * $this->maxRatio
+                ),
+            ]
+        );
     }
 
     /**

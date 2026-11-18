@@ -3,7 +3,9 @@
 namespace Selective\ArchiveBomb\Engine;
 
 use RuntimeException;
+use Selective\ArchiveBomb\Scanner\BombEvidence;
 use Selective\ArchiveBomb\Scanner\BombScannerResult;
+use Selective\ArchiveBomb\Scanner\BombStatus;
 use SplFileObject;
 
 /**
@@ -11,6 +13,21 @@ use SplFileObject;
  */
 final class PngBompEngine implements EngineInterface
 {
+    /**
+     * Stable identifier used as prefix for every evidence identity.
+     */
+    public const ENGINE_ID = 'png';
+
+    /**
+     * Get the stable engine identifier.
+     *
+     * @return string The engine identifier
+     */
+    public function getId(): string
+    {
+        return self::ENGINE_ID;
+    }
+
     /**
      * Scan for PNG bomb.
      *
@@ -30,7 +47,7 @@ final class PngBompEngine implements EngineInterface
 
         if (!$this->isPng($file)) {
             // This is not a PNG
-            return new BombScannerResult(false);
+            return new BombScannerResult(BombStatus::Safe);
         }
 
         $file->rewind();
@@ -48,10 +65,22 @@ final class PngBompEngine implements EngineInterface
 
         if ($width > 10000 || $height > 10000) {
             // Invalid image
-            return new BombScannerResult(true);
+            return new BombScannerResult(
+                BombStatus::Bomb,
+                [
+                    new BombEvidence(
+                        $this->getId(),
+                        'image#dimensions',
+                        BombStatus::Bomb,
+                        sprintf('PNG dimensions %dx%d exceed the 10000 pixel limit.', $width, $height),
+                        0.0,
+                        (float)($width * $height)
+                    ),
+                ]
+            );
         }
 
-        return new BombScannerResult(false);
+        return new BombScannerResult(BombStatus::Safe);
     }
 
     /**

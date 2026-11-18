@@ -42,10 +42,38 @@ $scannerResult = $scanner->scanFile($file);
 
 if ($scannerResult->isBomb()) {
     echo 'Archive bomb detected!';
+} elseif ($scannerResult->isUnknown()) {
+    echo 'The archive could not be assessed completely (encrypted, split or damaged).';
 } else {
     echo 'File is clean';
 }
 ```
+
+### Result states and evidence
+
+Every scan returns one of three states:
+
+* `BombStatus::Bomb` - a bomb pattern was confirmed (`isBomb()` returns `true`)
+* `BombStatus::Unknown` - the input could not be assessed completely, for
+  example an encrypted RAR entry, an entry that crosses a multi-volume
+  boundary, an entry with zero packed size or a damaged volume
+* `BombStatus::Safe` - the input was inspected and no bomb was found
+
+Each finding is represented by a `BombEvidence` value object with a stable,
+deterministic identity of the form `engine:entry`, for example
+`rar:entry#3:Desktop/10GB` or `rar:archive#total`. The identity does not
+depend on the other registered engines and stays identical across repeated
+scans. Use `getEvidence()`, `getBombEvidence()` and `getUnknownEvidence()`
+to explain which engine and entry produced a verdict.
+
+### RAR scanning rules
+
+The RAR engine no longer evaluates every entry against an isolated
+unpacked/packed ratio. Instead all entries share one total expansion budget:
+the sum of all unpacked entry sizes is compared with the archive size
+multiplied by the configured ratio. Entries that cannot be evaluated
+(encrypted, volume spanning or zero packed size) make the verdict `Unknown`
+instead of silently passing.
 
 ### Scan in-memory ZIP file
 

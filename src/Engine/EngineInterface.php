@@ -11,6 +11,16 @@ use SplFileObject;
 interface EngineInterface
 {
     /**
+     * Get the stable identifier of the engine.
+     *
+     * The identifier is part of every evidence identity and must not change
+     * between runs or depend on other registered engines.
+     *
+     * @return string The engine identifier
+     */
+    public function getId(): string;
+
+    /**
      * Detect.
      *
      * @param SplFileObject $file The file
