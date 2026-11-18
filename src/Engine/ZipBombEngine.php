@@ -8,16 +8,24 @@ use SplFileObject;
 
 /**
  * ZIP bomb scanner.
+ *
+ * The sizes declared in the ZIP central directory are attacker controlled and
+ * are therefore only used as budget hints. Every member is read from its local
+ * file header and verified against the actual data stream. Structural problems,
+ * truncated streams, CRC failures or method conflicts make the result
+ * inconclusive ("unknown") instead of silently reporting the archive as safe.
  */
 final class ZipBombEngine implements EngineInterface
 {
+    private const ENGINE_NAME = 'zip';
     private const MAX_RECURSION_DEPTH = 20;
     private const MAX_NESTED_ARCHIVE_SIZE = 104857600;
+    private const MAX_ENTRY_DECOMPRESSED_SIZE = 104857600;
 
     /**
-     * @var array<string, float>
+     * @var bool Whether entries that could not be fully verified were found
      */
-    private array $nestedArchiveSizes = [];
+    private bool $unknownEntries = false;
 
     /**
      * @var int
@@ -52,515 +60,442 @@ final class ZipBombEngine implements EngineInterface
         }
 
         if (!$this->isZip($file)) {
-            return new BombScannerResult(false);
+            return new BombScannerResult(false, self::ENGINE_NAME, 'Not a ZIP file');
         }
 
-        $fileSize = $file->getSize();
-        $result = $fileSize > 0 && $this->getOriginalSizeFromFile($file, $fileSize * $this->maxRatio) >=
-            $fileSize * $this->maxRatio;
+        // The verification state is only valid within a single scan.
+        $this->unknownEntries = false;
 
-        return new BombScannerResult($result);
+        $fileSize = (int)$file->getSize();
+
+        if ($fileSize <= 0) {
+            return new BombScannerResult(false, self::ENGINE_NAME, 'Empty file');
+        }
+
+        $maxSize = $fileSize * $this->maxRatio;
+        $accumulator = new SizeAccumulator();
+        $isBomb = $this->scanSource(new FileZipSource($file), $maxSize, 0, $accumulator);
+
+        if ($isBomb) {
+            return new BombScannerResult(
+                true,
+                self::ENGINE_NAME,
+                sprintf('ZIP bomb detected: expansion ratio exceeds %d', $this->maxRatio),
+                BombScannerResult::STATUS_BOMB
+            );
+        }
+
+        if ($this->unknownEntries) {
+            return new BombScannerResult(
+                false,
+                self::ENGINE_NAME,
+                'Archive contains encrypted, unsupported or corrupted entries',
+                BombScannerResult::STATUS_UNKNOWN
+            );
+        }
+
+        return new BombScannerResult(
+            false,
+            self::ENGINE_NAME,
+            'No ZIP bomb detected',
+            BombScannerResult::STATUS_SAFE
+        );
     }
 
     /**
-     * Read original archive size from file central directory metadata.
+     * Scan every member of a ZIP source and accumulate its measured expansion.
      *
-     * @param SplFileObject $file The zip file
-     * @param float $maxSize The maximum size to read
+     * The same accumulator is shared across all recursion levels so deep nesting
+     * short circuits against the global budget instead of exploding into a full
+     * tree traversal.
+     *
+     * @param ZipSource $source The archive source
+     * @param float $maxSize The global size budget
      * @param int $depth The recursion depth
+     * @param SizeAccumulator $accumulator The shared running total
      *
-     * @throws RuntimeException
+     * @return bool Whether bomb evidence was found
      *
-     * @return float The original size
+     * @phpstan-impure
      */
-    private function getOriginalSizeFromFile(SplFileObject $file, float $maxSize, int $depth = 0): float
-    {
-        $entries = $this->readFileCentralDirectoryEntries($file);
+    private function scanSource(
+        ZipSource $source,
+        float $maxSize,
+        int $depth,
+        SizeAccumulator $accumulator
+    ): bool {
+        $entries = $source->readCentralDirectoryEntries();
 
-        if ($entries === []) {
-            return (float)$file->getSize();
+        if ($entries === null) {
+            // The container claims to be a ZIP but its structure is broken.
+            $this->unknownEntries = true;
+
+            return false;
         }
-
-        $size = 0.0;
 
         foreach ($entries as $entry) {
-            $entryCompressedSize = (int)$entry['compressed_size'];
-            $entryOriginalSize = (int)$entry['original_size'];
+            $declaredCompressedSize = (int)$entry['compressed_size'];
+            $declaredOriginalSize = (int)$entry['original_size'];
 
-            if ($entryCompressedSize === 0 && $entryOriginalSize > 0) {
-                return $maxSize;
+            $verified = $this->verifyEntry($source, $entry, $depth, $maxSize, $accumulator);
+
+            if ($verified->isBomb) {
+                return true;
             }
 
-            if ($entryCompressedSize === 0) {
-                continue;
+            $entryOriginalSize = $verified->originalSize;
+            $entryCompressedSize = $verified->compressedSize;
+
+            // Ratio evidence is only trusted for members whose actual stream was
+            // fully verified. Corrupted or encrypted members already downgrade the
+            // whole archive to "unknown" and must never trigger a bomb ratio.
+            if (
+                $verified->isVerified
+                && $entryCompressedSize > 0
+                && $entryOriginalSize / $entryCompressedSize >= $this->maxRatio
+            ) {
+                return true;
             }
 
-            $entryOriginalSize = $this->getFileEntryOriginalSize($file, $entry, $depth, $maxSize - $size);
-            $ratio = $entryOriginalSize / $entryCompressedSize;
-
-            if ($ratio >= $this->maxRatio) {
-                return $maxSize;
+            // Only measured sizes feed the running total. A member that could not
+            // be verified keeps its declared size as a hint but must never inflate
+            // the total, otherwise a forged declaration could manufacture a bomb
+            // verdict by itself. Verified nested archives already contributed their
+            // own expansion through the shared accumulator (and report zero here).
+            if ($verified->isVerified) {
+                $accumulator->add($entryOriginalSize);
             }
 
-            $size += $entryOriginalSize;
-
-            if ($size >= $maxSize) {
-                return $maxSize;
+            if ($accumulator->getTotal() >= $maxSize) {
+                return true;
             }
         }
 
-        return $size;
+        return false;
     }
 
     /**
-     * Read original entry size from a file ZIP archive.
+     * Verify a single central directory entry against its actual data stream.
      *
-     * @param SplFileObject $file The zip file
+     * @param ZipSource $source The archive source
      * @param array<string, int|string> $entry The central directory entry
      * @param int $depth The recursion depth
-     * @param float $maxSize The maximum size to read
+     * @param float $maxSize The global size budget
+     * @param SizeAccumulator $accumulator The shared running total
      *
-     * @throws RuntimeException
+     * @return EntryVerification The verification result
      *
-     * @return float The original size
+     * @phpstan-impure
      */
-    private function getFileEntryOriginalSize(SplFileObject $file, array $entry, int $depth, float $maxSize): float
-    {
-        $originalSize = (int)$entry['original_size'];
+    private function verifyEntry(
+        ZipSource $source,
+        array $entry,
+        int $depth,
+        float $maxSize,
+        SizeAccumulator $accumulator
+    ): EntryVerification {
+        $declaredCompressedSize = (int)$entry['compressed_size'];
+        $declaredOriginalSize = (int)$entry['original_size'];
+        $localHeader = $source->readLocalHeader((int)$entry['local_header_offset']);
 
-        if ($depth >= self::MAX_RECURSION_DEPTH || $originalSize > self::MAX_NESTED_ARCHIVE_SIZE) {
-            return (float)$originalSize;
+        if ($localHeader === null) {
+            return $this->unverifiedEntry($declaredOriginalSize, $declaredCompressedSize);
+        }
+
+        if (!$this->isEntryStructurallyVerifiable($entry, $localHeader)) {
+            // Encrypted members, method conflicts and unsupported methods cannot be
+            // verified against the actual stream. Their declared sizes stay budget
+            // hints; a clean result degrades to "unknown" instead of claiming safety.
+            return $this->unverifiedEntry($declaredOriginalSize, $declaredCompressedSize);
+        }
+
+        $method = (int)$entry['method'];
+
+        if ($declaredCompressedSize === 0 && $declaredOriginalSize === 0) {
+            // A genuine empty member; the data stream must also be empty.
+            $payload = $source->readPayload($localHeader, 0);
+
+            if ($payload === null || $payload !== '') {
+                return $this->unverifiedEntry($declaredOriginalSize, $declaredCompressedSize);
+            }
+
+            return EntryVerification::verified(0, 0);
+        }
+
+        $payload = $source->readPayload($localHeader, $declaredCompressedSize);
+
+        if ($payload === null) {
+            // The declared compressed size reaches past the archive (truncated).
+            return $this->unverifiedEntry($declaredOriginalSize, $declaredCompressedSize);
+        }
+
+        $measurement = $this->measureEntryStream($entry, $payload, $method, $depth);
+
+        if ($measurement->isBomb) {
+            return EntryVerification::bomb(self::MAX_ENTRY_DECOMPRESSED_SIZE, $declaredCompressedSize);
+        }
+
+        if (!$measurement->isValid) {
+            // Invalid or truncated deflate stream; never treat it as a bomb.
+            return $this->unverifiedEntry($declaredOriginalSize, $declaredCompressedSize);
+        }
+
+        $actualOriginalSize = $measurement->originalLength;
+        $actualCompressedSize = $measurement->consumed;
+        $actualCrc = $measurement->crcHash;
+        $decompressedData = (string)$measurement->data;
+
+        if (!$this->matchesDeclarations($entry, $actualOriginalSize, $actualCompressedSize, $actualCrc)) {
+            // The declared metadata does not match the actual, verified stream.
+            return $this->unverifiedEntry($actualOriginalSize, $actualCompressedSize);
         }
 
         $name = (string)$entry['name'];
 
-        if (!str_ends_with(strtolower($name), '.zip')) {
-            return (float)$originalSize;
+        if (str_ends_with(strtolower($name), '.zip')) {
+            return $this->verifyNestedEntry(
+                $decompressedData,
+                $actualOriginalSize,
+                $actualCompressedSize,
+                $depth,
+                $maxSize,
+                $accumulator
+            );
         }
 
-        $contents = $this->getFileEntryContents($file, $entry);
-
-        if (!is_string($contents) || !str_starts_with($contents, "PK\3\4")) {
-            return (float)$originalSize;
-        }
-
-        return $this->getOriginalSizeFromContents($contents, $maxSize, $depth + 1);
+        return EntryVerification::verified($actualOriginalSize, $actualCompressedSize);
     }
 
     /**
-     * Read ZIP central directory entries from a file.
+     * Compare the measured stream against the declared central directory metadata.
      *
-     * @param SplFileObject $file The zip file
-     *
-     * @return array<int, array<string, int|string>> The central directory entries
-     */
-    private function readFileCentralDirectoryEntries(SplFileObject $file): array
-    {
-        $fileSize = $file->getSize();
-
-        if ($fileSize === false) {
-            return [];
-        }
-
-        $tailSize = min($fileSize, 65557);
-        $tailOffset = $fileSize - $tailSize;
-        $tail = $this->readFileBytes($file, $tailOffset, $tailSize);
-        $relativeEocdOffset = $this->findEndOfCentralDirectoryOffset($tail);
-
-        if ($relativeEocdOffset === null || strlen($tail) < $relativeEocdOffset + 22) {
-            return [];
-        }
-
-        $entryCount = $this->readUnsignedShort($tail, $relativeEocdOffset + 10);
-        $centralDirectoryOffset = $this->readUnsignedLong($tail, $relativeEocdOffset + 16);
-        $entries = [];
-        $offset = $centralDirectoryOffset;
-
-        for ($i = 0; $i < $entryCount; $i++) {
-            $entry = $this->readFileCentralDirectoryEntry($file, $offset);
-
-            if ($entry === null) {
-                return [];
-            }
-
-            $entries[] = $entry;
-            $offset += 46 + (int)$entry['name_length'] + (int)$entry['extra_length'] + (int)$entry['comment_length'];
-        }
-
-        return $entries;
-    }
-
-    /**
-     * Read a ZIP central directory entry from a file.
-     *
-     * @param SplFileObject $file The zip file
-     * @param int $offset The central directory entry offset
-     *
-     * @return array<string, int|string>|null The entry
-     */
-    private function readFileCentralDirectoryEntry(SplFileObject $file, int $offset): ?array
-    {
-        $header = $this->readFileBytes($file, $offset, 46);
-
-        if (strlen($header) < 46 || substr($header, 0, 4) !== "PK\1\2") {
-            return null;
-        }
-
-        $nameLength = $this->readUnsignedShort($header, 28);
-        $extraLength = $this->readUnsignedShort($header, 30);
-        $commentLength = $this->readUnsignedShort($header, 32);
-        $name = $this->readFileBytes($file, $offset + 46, $nameLength);
-
-        if (strlen($name) < $nameLength) {
-            return null;
-        }
-
-        return [
-            'flags' => $this->readUnsignedShort($header, 8),
-            'method' => $this->readUnsignedShort($header, 10),
-            'compressed_size' => $this->readUnsignedLong($header, 20),
-            'original_size' => $this->readUnsignedLong($header, 24),
-            'name_length' => $nameLength,
-            'extra_length' => $extraLength,
-            'comment_length' => $commentLength,
-            'local_header_offset' => $this->readUnsignedLong($header, 42),
-            'name' => $name,
-        ];
-    }
-
-    /**
-     * Read an entry contents from a file ZIP archive.
-     *
-     * @param SplFileObject $file The zip file
      * @param array<string, int|string> $entry The central directory entry
+     * @param int $actualOriginalSize The measured original size
+     * @param int $actualCompressedSize The measured compressed size
+     * @param string $actualCrc The measured CRC32 checksum
      *
-     * @return string|null The entry contents
+     * @return bool Whether the declarations match the actual stream
      */
-    private function getFileEntryContents(SplFileObject $file, array $entry): ?string
+    private function matchesDeclarations(
+        array $entry,
+        int $actualOriginalSize,
+        int $actualCompressedSize,
+        string $actualCrc
+    ): bool {
+        return $actualOriginalSize === (int)$entry['original_size']
+            && $actualCompressedSize === (int)$entry['compressed_size']
+            && $this->crc32ToHex((int)$entry['crc']) === $actualCrc;
+    }
+
+    /**
+     * Check whether an entry can be verified against its actual data stream.
+     *
+     * @param array<string, int|string> $entry The central directory entry
+     * @param array<string, int> $localHeader The parsed local header
+     *
+     * @return bool Whether the entry structure is verifiable
+     */
+    private function isEntryStructurallyVerifiable(array $entry, array $localHeader): bool
     {
         $flags = (int)$entry['flags'];
+        $method = (int)$entry['method'];
+        $isEncrypted = ($flags & 1) === 1 || ($localHeader['flags'] & 1) === 1;
 
-        if (($flags & 1) === 1) {
-            return null;
-        }
-
-        $offset = (int)$entry['local_header_offset'];
-        $header = $this->readFileBytes($file, $offset, 30);
-
-        if (strlen($header) < 30 || substr($header, 0, 4) !== "PK\3\4") {
-            return null;
-        }
-
-        $nameLength = $this->readUnsignedShort($header, 26);
-        $extraLength = $this->readUnsignedShort($header, 28);
-        $payloadOffset = $offset + 30 + $nameLength + $extraLength;
-        $payload = $this->readFileBytes($file, $payloadOffset, (int)$entry['compressed_size']);
-
-        if (strlen($payload) < (int)$entry['compressed_size']) {
-            return null;
-        }
-
-        return $this->decompressEntryPayload($payload, (int)$entry['method']);
+        return !$isEncrypted
+            && $method === (int)$localHeader['method']
+            && ($method === 0 || $method === 8);
     }
 
     /**
-     * Read original ZIP archive size from nested archive contents.
+     * Measure an entry payload against its actual data stream.
      *
-     * @param string $contents The zip archive contents
-     * @param float $maxSize The maximum size to read
-     * @param int $depth The recursion depth
-     *
-     * @throws RuntimeException
-     *
-     * @return float The original size
-     */
-    private function getOriginalSizeFromContents(string $contents, float $maxSize, int $depth): float
-    {
-        $key = sha1($contents);
-
-        if (isset($this->nestedArchiveSizes[$key])) {
-            return min($this->nestedArchiveSizes[$key], $maxSize);
-        }
-
-        $result = $this->getOriginalSizeFromZipContents($contents, $maxSize, $depth);
-        $this->nestedArchiveSizes[$key] = $result;
-
-        return $result;
-    }
-
-    /**
-     * Read original ZIP archive size from in-memory ZIP archive contents.
-     *
-     * @param string $contents The zip archive contents
-     * @param float $maxSize The maximum size to read
-     * @param int $depth The recursion depth
-     *
-     * @return float The original size
-     */
-    private function getOriginalSizeFromZipContents(string $contents, float $maxSize, int $depth): float
-    {
-        $entries = $this->readCentralDirectoryEntries($contents);
-
-        if ($entries === []) {
-            return (float)strlen($contents);
-        }
-
-        $size = 0.0;
-
-        foreach ($entries as $entry) {
-            $entryCompressedSize = (int)$entry['compressed_size'];
-            $entryOriginalSize = (int)$entry['original_size'];
-
-            if ($entryCompressedSize === 0 && $entryOriginalSize > 0) {
-                return $maxSize;
-            }
-
-            if ($entryCompressedSize === 0) {
-                continue;
-            }
-
-            $entryOriginalSize = $this->getMemoryEntryOriginalSize($contents, $entry, $depth, $maxSize - $size);
-            $ratio = $entryOriginalSize / $entryCompressedSize;
-
-            if ($ratio >= $this->maxRatio) {
-                return $maxSize;
-            }
-
-            $size += $entryOriginalSize;
-
-            if ($size >= $maxSize) {
-                return $maxSize;
-            }
-        }
-
-        return $size;
-    }
-
-    /**
-     * Read original entry size from in-memory ZIP archive contents.
-     *
-     * @param string $contents The zip archive contents
      * @param array<string, int|string> $entry The central directory entry
-     * @param int $depth The recursion depth
-     * @param float $maxSize The maximum size to read
-     *
-     * @return float The original size
-     */
-    private function getMemoryEntryOriginalSize(string $contents, array $entry, int $depth, float $maxSize): float
-    {
-        $originalSize = (int)$entry['original_size'];
-
-        if ($depth >= self::MAX_RECURSION_DEPTH || $originalSize > self::MAX_NESTED_ARCHIVE_SIZE) {
-            return (float)$originalSize;
-        }
-
-        $name = (string)$entry['name'];
-
-        if (!str_ends_with(strtolower($name), '.zip')) {
-            return (float)$originalSize;
-        }
-
-        $nestedContents = $this->getMemoryEntryContents($contents, $entry);
-
-        if (!is_string($nestedContents) || !str_starts_with($nestedContents, "PK\3\4")) {
-            return (float)$originalSize;
-        }
-
-        return $this->getOriginalSizeFromContents($nestedContents, $maxSize, $depth + 1);
-    }
-
-    /**
-     * Read ZIP central directory entries from in-memory ZIP archive contents.
-     *
-     * @param string $contents The zip archive contents
-     *
-     * @return array<int, array<string, int|string>> The central directory entries
-     */
-    private function readCentralDirectoryEntries(string $contents): array
-    {
-        $eocdOffset = $this->findEndOfCentralDirectoryOffset($contents);
-
-        if ($eocdOffset === null || strlen($contents) < $eocdOffset + 22) {
-            return [];
-        }
-
-        $entryCount = $this->readUnsignedShort($contents, $eocdOffset + 10);
-        $centralDirectoryOffset = $this->readUnsignedLong($contents, $eocdOffset + 16);
-        $entries = [];
-        $offset = $centralDirectoryOffset;
-
-        for ($i = 0; $i < $entryCount; $i++) {
-            $entry = $this->readCentralDirectoryEntry($contents, $offset);
-
-            if ($entry === null) {
-                return [];
-            }
-
-            $entries[] = $entry;
-            $offset += 46 + (int)$entry['name_length'] + (int)$entry['extra_length'] + (int)$entry['comment_length'];
-        }
-
-        return $entries;
-    }
-
-    /**
-     * Read a ZIP central directory entry.
-     *
-     * @param string $contents The zip archive contents
-     * @param int $offset The central directory entry offset
-     *
-     * @return array<string, int|string>|null The entry
-     */
-    private function readCentralDirectoryEntry(string $contents, int $offset): ?array
-    {
-        if (strlen($contents) < $offset + 46 || substr($contents, $offset, 4) !== "PK\1\2") {
-            return null;
-        }
-
-        $nameLength = $this->readUnsignedShort($contents, $offset + 28);
-        $extraLength = $this->readUnsignedShort($contents, $offset + 30);
-        $commentLength = $this->readUnsignedShort($contents, $offset + 32);
-        $nameOffset = $offset + 46;
-
-        if (strlen($contents) < $nameOffset + $nameLength + $extraLength + $commentLength) {
-            return null;
-        }
-
-        return [
-            'flags' => $this->readUnsignedShort($contents, $offset + 8),
-            'method' => $this->readUnsignedShort($contents, $offset + 10),
-            'compressed_size' => $this->readUnsignedLong($contents, $offset + 20),
-            'original_size' => $this->readUnsignedLong($contents, $offset + 24),
-            'name_length' => $nameLength,
-            'extra_length' => $extraLength,
-            'comment_length' => $commentLength,
-            'local_header_offset' => $this->readUnsignedLong($contents, $offset + 42),
-            'name' => substr($contents, $nameOffset, $nameLength),
-        ];
-    }
-
-    /**
-     * Read an in-memory ZIP entry contents.
-     *
-     * @param string $contents The zip archive contents
-     * @param array<string, int|string> $entry The central directory entry
-     *
-     * @return string|null The entry contents
-     */
-    private function getMemoryEntryContents(string $contents, array $entry): ?string
-    {
-        $flags = (int)$entry['flags'];
-
-        if (($flags & 1) === 1) {
-            return null;
-        }
-
-        $offset = (int)$entry['local_header_offset'];
-
-        if (strlen($contents) < $offset + 30 || substr($contents, $offset, 4) !== "PK\3\4") {
-            return null;
-        }
-
-        $nameLength = $this->readUnsignedShort($contents, $offset + 26);
-        $extraLength = $this->readUnsignedShort($contents, $offset + 28);
-        $payloadOffset = $offset + 30 + $nameLength + $extraLength;
-        $compressedSize = (int)$entry['compressed_size'];
-
-        if (strlen($contents) < $payloadOffset + $compressedSize) {
-            return null;
-        }
-
-        $payload = substr($contents, $payloadOffset, $compressedSize);
-
-        return $this->decompressEntryPayload($payload, (int)$entry['method']);
-    }
-
-    /**
-     * Decompress a ZIP entry payload.
-     *
      * @param string $payload The compressed payload
      * @param int $method The compression method
+     * @param int $depth The recursion depth
      *
-     * @return string|null The decompressed payload
+     * @return InflationResult The measured stream
      */
-    private function decompressEntryPayload(string $payload, int $method): ?string
+    private function measureEntryStream(array $entry, string $payload, int $method, int $depth): InflationResult
     {
         if ($method === 0) {
-            return $payload;
+            $length = strlen($payload);
+
+            return new InflationResult(false, true, $length, $length, $this->crc32Hex($payload), $payload);
         }
 
-        if ($method !== 8) {
-            return null;
-        }
+        $retainData = $depth < self::MAX_RECURSION_DEPTH
+            && str_ends_with(strtolower((string)$entry['name']), '.zip');
 
-        $result = gzinflate($payload);
-
-        return is_string($result) ? $result : null;
+        // The decompression cap protects the scanner itself; it is not the bomb
+        // budget. Declared sizes are only hints and must never limit inflation.
+        return $this->inflatePayload($payload, self::MAX_ENTRY_DECOMPRESSED_SIZE, $retainData);
     }
 
     /**
-     * Find the end of central directory record offset.
+     * Verify a member that carries a nested ZIP archive.
      *
-     * @param string $contents The zip archive contents
+     * @param string $decompressedData The verified member data
+     * @param int $originalSize The measured original size
+     * @param int $compressedSize The measured compressed size
+     * @param int $depth The recursion depth
+     * @param float $maxSize The global size budget
+     * @param SizeAccumulator $accumulator The shared running total
      *
-     * @return int|null The offset
+     * @return EntryVerification The verification result
+     *
+     * @phpstan-impure
      */
-    private function findEndOfCentralDirectoryOffset(string $contents): ?int
-    {
-        $length = strlen($contents);
-        $start = max(0, $length - 65557);
+    private function verifyNestedEntry(
+        string $decompressedData,
+        int $originalSize,
+        int $compressedSize,
+        int $depth,
+        float $maxSize,
+        SizeAccumulator $accumulator
+    ): EntryVerification {
+        if ($depth >= self::MAX_RECURSION_DEPTH || $originalSize > self::MAX_NESTED_ARCHIVE_SIZE) {
+            // The member itself was fully verified, but its nested content cannot
+            // be inspected further. Flag inconclusive while still contributing the
+            // measured size so deep nesting keeps short circuiting the budget.
+            $this->unknownEntries = true;
 
-        for ($offset = $length - 22; $offset >= $start; $offset--) {
-            if (substr($contents, $offset, 4) === "PK\5\6") {
-                return $offset;
+            return EntryVerification::verified($originalSize, $compressedSize);
+        }
+
+        if (!str_starts_with($decompressedData, "PK\3\4")) {
+            // A member named .zip without a ZIP signature is not a nested archive.
+            return EntryVerification::verified($originalSize, $compressedSize);
+        }
+
+        $nestedIsBomb = $this->scanSource(
+            new StringZipSource($decompressedData),
+            $maxSize,
+            $depth + 1,
+            $accumulator
+        );
+
+        if ($nestedIsBomb) {
+            return EntryVerification::bomb($maxSize, $compressedSize);
+        }
+
+        // The nested expansion was already added to the shared accumulator; avoid
+        // counting the container bytes themselves a second time.
+        return EntryVerification::verified(0, $compressedSize);
+    }
+
+    /**
+     * Inflate a raw deflate payload with a hard decompression budget.
+     *
+     * @param string $payload The compressed payload
+     * @param float $maxSize The maximum number of decompressed bytes
+     * @param bool $retainData Whether to keep the decompressed bytes in memory
+     *
+     * @return InflationResult The inflation outcome
+     */
+    private function inflatePayload(string $payload, float $maxSize, bool $retainData): InflationResult
+    {
+        $context = inflate_init(ZLIB_ENCODING_RAW);
+
+        if ($context === false) {
+            return new InflationResult(false, false, 0, 0);
+        }
+
+        $crcContext = hash_init('crc32b');
+        $data = '';
+        $originalLength = 0;
+        $offset = 0;
+        $length = strlen($payload);
+        // Small input chunks keep the temporary decompression block bounded even
+        // for highly compressible bomb streams.
+        $chunkSize = 8192;
+
+        while ($offset < $length) {
+            $chunk = substr($payload, $offset, $chunkSize);
+            $output = inflate_add($context, $chunk, ZLIB_NO_FLUSH);
+
+            if ($output === false) {
+                return new InflationResult(false, false, $offset, $originalLength);
+            }
+
+            $outputLength = strlen($output);
+
+            if ($originalLength + $outputLength > $maxSize) {
+                // The real stream expands beyond the cap: bomb evidence.
+                return new InflationResult(true, false, $offset, $originalLength + $outputLength);
+            }
+
+            hash_update($crcContext, $output);
+            $originalLength += $outputLength;
+
+            if ($retainData) {
+                $data .= $output;
+            }
+
+            $offset += strlen($chunk);
+
+            if (inflate_get_status($context) === ZLIB_STREAM_END) {
+                break;
             }
         }
 
-        return null;
+        // A valid deflate member must reach the explicit stream end state.
+        // Truncated input stays in ZLIB_OK and corrupted input enters an error state.
+        if (inflate_get_status($context) !== ZLIB_STREAM_END) {
+            return new InflationResult(false, false, $offset, $originalLength);
+        }
+
+        $consumed = (int)inflate_get_read_len($context);
+
+        return new InflationResult(
+            false,
+            true,
+            $consumed,
+            $originalLength,
+            (string)hash_final($crcContext),
+            $retainData ? $data : null
+        );
     }
 
     /**
-     * Read bytes from a file.
+     * Build an unverified entry result and flag the archive as inconclusive.
      *
-     * @param SplFileObject $file The file
-     * @param int $offset The offset
-     * @param int $length The length
+     * @param int $originalSize The usable original size
+     * @param int $compressedSize The usable compressed size
      *
-     * @return string The bytes
+     * @return EntryVerification The verification result
+     *
+     * @phpstan-impure
      */
-    private function readFileBytes(SplFileObject $file, int $offset, int $length): string
+    private function unverifiedEntry(int $originalSize, int $compressedSize): EntryVerification
     {
-        $file->fseek($offset);
+        $this->unknownEntries = true;
 
-        $contents = $file->fread($length);
-
-        return is_string($contents) ? $contents : '';
+        return EntryVerification::unverified($originalSize, $compressedSize);
     }
 
     /**
-     * Read an unsigned little-endian short.
+     * Calculate a CRC32 checksum as an eight character hexadecimal string.
      *
-     * @param string $contents The contents
-     * @param int $offset The offset
+     * @param string $data The data
      *
-     * @return int The value
+     * @return string The checksum
      */
-    private function readUnsignedShort(string $contents, int $offset): int
+    private function crc32Hex(string $data): string
     {
-        return unpack('v', substr($contents, $offset, 2))[1];
+        return hash('crc32b', $data);
     }
 
     /**
-     * Read an unsigned little-endian long.
+     * Convert a central directory CRC32 integer to its hexadecimal representation.
      *
-     * @param string $contents The contents
-     * @param int $offset The offset
+     * @param int $crc The checksum
      *
-     * @return int The value
+     * @return string The eight character hexadecimal checksum
      */
-    private function readUnsignedLong(string $contents, int $offset): int
+    private function crc32ToHex(int $crc): string
     {
-        return unpack('V', substr($contents, $offset, 4))[1];
+        return sprintf('%08x', $crc);
     }
 
     /**

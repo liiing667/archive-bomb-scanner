@@ -47,6 +47,29 @@ if ($scannerResult->isBomb()) {
 }
 ```
 
+### Scan result status
+
+The sizes declared inside a ZIP archive are attacker controlled, so they are
+only used as budget hints. The scanner verifies every member against its actual
+data stream and reports one of three explicit statuses:
+
+```php
+$scannerResult = $scanner->scanFile($file);
+
+$scannerResult->isBomb();    // true only when bomb evidence was verified
+$scannerResult->getStatus(); // "safe", "unknown" or "bomb"
+$scannerResult->isSafe();    // true only when every member was fully verified
+$scannerResult->isUnknown(); // true when members cannot be fully inspected
+$scannerResult->getEngineName();
+$scannerResult->getReason();
+```
+
+A member that is encrypted, uses an unsupported compression method, has a
+method conflict, a CRC/size mismatch or a truncated or otherwise corrupted
+stream cannot be verified. Such an archive is reported as `unknown` instead of
+being silently treated as safe, while archives that genuinely expand beyond the
+configured ratio are still detected as bombs.
+
 ### Scan in-memory ZIP file
 
 ```php
